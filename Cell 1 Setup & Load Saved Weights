@@ -1,1 +1,84 @@
 
+!pip install -q chess zstandard
+!apt-get install -y stockfish -q > /dev/null 2>&1
+!pip install zstandard
+
+import math
+import random
+import statistics
+import json
+import os
+import io
+import urllib.request
+from IPython.display import SVG, display
+
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+
+import chess
+import chess.engine
+import chess.svg
+import chess.pgn
+import pandas as pd
+import zstandard as zstd
+from google.colab import drive
+
+drive.mount('/content/drive')
+
+DRIVE_CHECKPOINT_PATH = "/content/drive/MyDrive/babygpt_checkpoints/babygpt_best.pt"
+RESULTS_DIR = "/content/drive/MyDrive/babygpt_results"
+
+REASONABLE_MAX_PLIES = 400
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# Create output folder hierarchy in Drive
+folders = [
+    "visualizations", "games", "k_table", "elo",
+    "interesting_score", "repetition", "confidence_and_illegal_rate", "temperature_sweep"
+]
+for f in folders:
+    os.makedirs(os.path.join(RESULTS_DIR, f), exist_ok=True)
+
+checkpoint = torch.load(DRIVE_CHECKPOINT_PATH, map_location=device)
+
+n_embd = checkpoint["n_embd"]
+n_head = checkpoint["n_head"]
+n_layer = checkpoint["n_layer"]
+dropout = checkpoint["dropout"]
+block_size = checkpoint["block_size"]
+vocab_size = checkpoint["vocab_size"]
+
+PROMOTION_PIECES = [None, chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]
+
+def build_move_vocab():
+    moves = set()
+    for from_sq in chess.SQUARES:
+        from_file = chess.square_file(from_sq)
+        from_rank = chess.square_rank(from_sq)
+        for to_sq in chess.SQUARES:
+            if to_sq == from_sq:
+                continue
+            to_file, to_rank = chess.square_file(to_sq), chess.square_rank(to_sq)
+            d_file, d_rank = to_file - from_file, to_rank - from_rank
+            if (d_file == 0 or d_rank == 0) or (abs(d_file) == abs(d_rank)) or ((abs(d_file), abs(d_rank)) in [(1, 2), (2, 1)]):
+                moves.add((from_sq, to_sq, None))
+                if (from_rank == 6 and to_rank == 7) or (from_rank == 1 and to_rank == 0):
+                    for promo in PROMOTION_PIECES[1:]:
+                        moves.add((from_sq, to_sq, promo))
+
+    moves = sorted(moves, key=lambda m: (m[0], m[1], -1 if m[2] is None else m[2]))
+    return {m: i for i, m in enumerate(moves)}, {i: m for i, m in enumerate(moves)}
+
+move_to_id, id_to_move = build_move_vocab()
+NUM_MOVE_TOKENS = len(move_to_id)
+SPECIAL_TOKENS = ["<START>", "1-0", "0-1", "1/2-1/2", "*"]
+special_to_id = {tok: NUM_MOVE_TOKENS + i for i, tok in enumerate(SPECIAL_TOKENS)}
+id_to_special = {v: k for k, v in special_to_id.items()}
+
+def move_to_token_id(move: chess.Move) -> int:
+    return move_to_id[(move.from_square, move.to_square, move.promotion)]
+
+def token_id_to_move(token_id: int) -> chess.Move:
+    from_sq, to_sq, promo = id_to_move[token_id]
+    return chess.Move(from_sq, to_sq, promotion=promo)
